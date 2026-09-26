@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -767,6 +768,412 @@ def test_unrecognised_format_marker_refuses_startup(tmp_path):
     conn.close()
     with pytest.raises(RuntimeError, match="unrecognised digest_format"):
         NonceStore(path)
+
+
+# --- object-format migration: concurrency boundary ---------------------------
+
+
+class _StartStoreThread(threading.Thread):
+    """Thread whose target constructs a NonceStore (runs the migration)."""
+
+    def __init__(self, path):
+        super().__init__(daemon=True)
+        self.path = path
+        self.error = None
+        self.store = None
+
+    def run(self):
+        try:
+            self.store = NonceStore(self.path)
+        except BaseException as exc:  # captured, asserted by the caller
+            self.error = exc
+
+
+def _enable_wal(path):
+    """Put a legacy database into WAL mode before the migration starts.
+
+    The migration connection otherwise performs the one-time WAL switch
+    itself; doing it here lets a test hold a write lock and reliably park
+    the migration *after* it requested the lock (the WAL switch never
+    needs to run during the race window).
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _adaptive_gap_fill_commit(path, stream_id, sequence, data):
+    """One gap-fill commit that links in whatever encoding the database
+    currently declares.
+
+    Event row, digest and watermark advance commit in a single
+    ``BEGIN IMMEDIATE`` transaction (queuing behind any migration holding
+    the write lock). When the lock is acquired before the migration
+    committed, there is no marker, so the object (pre-fix) encoding is
+    used; once the migration has committed, the marker reads
+    ``array-v2`` and the array (current) encoding is used -- exactly the
+    distinction that decides whether a concurrent commit is lost by a
+    stale rebuild or serialised behind the migration.
+    """
+    conn = sqlite3.connect(path, timeout=15.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        marker_row = conn.execute(
+            "SELECT value FROM app_meta WHERE key = 'digest_format'"
+        ).fetchone()
+        marker = marker_row[0] if marker_row is not None else None
+        conn.execute(
+            "INSERT INTO stream_events VALUES (?,?,?,?,?)",
+            (
+                stream_id,
+                sequence,
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                f"n-{stream_id}-{sequence}",
+                2,
+            ),
+        )
+        (previous_blob,) = conn.execute(
+            "SELECT digest FROM stream_digests "
+            "WHERE stream_id = ? AND sequence = ?",
+            (stream_id, sequence - 1),
+        ).fetchone()
+        link = (
+            chain_digest if marker == DIGEST_FORMAT_ARRAY_V2
+            else legacy_chain_digest
+        )
+        conn.execute(
+            "INSERT INTO stream_digests VALUES (?,?,?)",
+            (
+                stream_id,
+                sequence,
+                link(bytes(previous_blob), stream_id, sequence, data),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO stream_watermarks VALUES (?, ?) "
+            "ON CONFLICT(stream_id) DO UPDATE SET "
+            "high_water = excluded.high_water",
+            (stream_id, sequence),
+        )
+        conn.commit()
+        return marker
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _legacy_buffered_commit_while_migration_waits(
+    path, stream_id, sequence, data, *, hold_seconds=0.6
+):
+    """Hold the write lock, then commit one event that stays buffered
+    behind a gap (no digest row, no watermark advance). The lock is held
+    before the migration starts so the migration deterministically waits
+    on it; when the commit lands it must be visible to the rebuild but,
+    being buffered, must not produce a link.
+    """
+    conn = sqlite3.connect(path, timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        time.sleep(hold_seconds)
+        conn.execute(
+            "INSERT INTO stream_events VALUES (?,?,?,?,?)",
+            (
+                stream_id,
+                sequence,
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                f"n-{stream_id}-{sequence}",
+                2,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _test_reproducing_the_race_setup(tmp_path):
+    """Object-format DB (stream s open through 3) ready to be migrated."""
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 4):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 3)")
+    _legacy_chain(conn, "s", (1, 2, 3))
+    conn.commit()
+    conn.close()
+    _enable_wal(path)
+    return path
+
+
+def test_migration_includes_event_committed_while_waiting_for_lock(
+    tmp_path, monkeypatch
+):
+    """The reported race: a peer opens seq 4 after the migration
+    verified the old chain but before the rebuild got its write lock.
+
+    In the old two-phase implementation the verify pass held a deferred
+    read snapshot while phase 2 raced for the write lock; a peer gap
+    fill committing in that window advanced the watermark past the
+    snapshot the rebuild stopped at, so seq 4 ended up unlinked even
+    though the array-v2 marker was written -- ``/integrity`` reported
+    sequence 4 invalid. Verification now runs *inside* the write
+    transaction: the peer simply queues, its commit becomes part of the
+    migration's snapshot and seq 4 is rebuilt with the rest.
+
+    The interleaving is made deterministic by slowing the first legacy
+    digest computation inside the migration's verification: in the old
+    implementation that computation happens on the unlocked read
+    snapshot (a concurrent writer commits during the sleep); in the new
+    implementation the write lock is already held and the writer waits.
+    """
+    import app.db as db_module
+
+    path = _test_reproducing_the_race_setup(tmp_path)
+
+    real_legacy_chain_digest = db_module.legacy_chain_digest
+
+    def slow_legacy_chain_digest(previous, stream_id, sequence, data):
+        if not slow_legacy_chain_digest.fired:
+            slow_legacy_chain_digest.fired = True
+            time.sleep(0.8)
+        return real_legacy_chain_digest(previous, stream_id, sequence, data)
+
+    slow_legacy_chain_digest.fired = False
+    monkeypatch.setattr(
+        db_module, "legacy_chain_digest", slow_legacy_chain_digest
+    )
+
+    peer_marker = []
+
+    def peer():
+        time.sleep(0.3)  # inside the migration's (slow) verification
+        peer_marker.append(
+            _adaptive_gap_fill_commit(path, "s", 4, {"v": 4})
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        peer_future = pool.submit(peer)
+        migrator_future = pool.submit(NonceStore, path)
+        store = migrator_future.result(15)
+        peer_future.result(15)
+
+    # Under the fixed transaction ordering the peer could not commit
+    # until the migration's write transaction committed, so it observed
+    # the array-v2 marker and linked seq 4 in the array encoding.
+    assert peer_marker == [DIGEST_FORMAT_ARRAY_V2]
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+
+    expected = ZERO_DIGEST
+    for i in (1, 2, 3, 4):
+        expected = chain_digest(expected, "s", i, {"v": i})
+    assert store.stream_integrity("s") == (0, 4, expected, None)
+    rows = _digest_rows(path, "s")
+    assert [sequence for sequence, _ in rows] == [1, 2, 3, 4]
+    assert rows[3][1] == chain_digest(
+        chain_digest(
+            chain_digest(
+                chain_digest(ZERO_DIGEST, "s", 1, {"v": 1}),
+                "s", 2, {"v": 2},
+            ),
+            "s", 3, {"v": 3},
+        ),
+        "s", 4, {"v": 4},
+    )
+
+
+def test_migration_serialises_a_writer_that_starts_before_it_finishes(tmp_path):
+    """A writer arriving while the migration holds the write lock queues
+    and observes the committed array-v2 state once it gets the lock: its
+    new event chains in the array encoding and nothing is unlinked.
+    """
+    path = _test_reproducing_the_race_setup(tmp_path)
+
+    def peer_writer():
+        # Retry like any other store operation blocked on the lock: once
+        # the migration committed, the marker is array-v2 and the gap
+        # fill uses the current (array) encoding.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                writer = NonceStore(path)
+                status, opened, watermark = writer.store_stream_event(
+                    nonce="n-s-4", method="POST", path="/streams/events",
+                    now=2, stream_id="s", sequence=4, data={"v": 4},
+                )
+                assert (status, opened, watermark) == ("ok", [4], 4)
+                return
+            except sqlite3.OperationalError:
+                time.sleep(0.01)
+        raise AssertionError("peer writer never acquired the write lock")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        migrator_future = pool.submit(NonceStore, path)
+        # Give the migration a head start at acquiring the lock.
+        time.sleep(0.2)
+        peer_future = pool.submit(peer_writer)
+        store = migrator_future.result(15)
+        peer_future.result(15)
+
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+    expected = ZERO_DIGEST
+    for i in (1, 2, 3, 4):
+        expected = chain_digest(expected, "s", i, {"v": i})
+    assert store.stream_integrity("s") == (0, 4, expected, None)
+
+
+def test_corruption_while_migration_holds_lock_still_aborts_cleanly(tmp_path):
+    """A pre-committed corruption cannot slip in between verification
+    and rebuild: the commit that corrupts a chain must either be visible
+    to verification (abort) or queue behind the migration. Here the bad
+    link is already committed before the lock is taken, so verification
+    rejects it inside the write transaction and the rollback leaves the
+    original object-format database byte-identical.
+    """
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 4):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 3)")
+    _legacy_chain(conn, "s", (1, 2, 3))
+    conn.execute(
+        "UPDATE stream_digests SET digest = ? "
+        "WHERE stream_id = 's' AND sequence = 2",
+        (b"\xaa" * 32,),
+    )
+    conn.commit()
+    conn.close()
+    _enable_wal(path)
+
+    before = _digest_rows(path, "s")
+
+    migrator = _StartStoreThread(path)
+    migrator.start()
+    migrator.join(15)
+    assert isinstance(migrator.error, ChainCorruptionError)
+    assert "sequence 2" in str(migrator.error)
+    assert _digest_rows(path, "s") == before
+    assert _format_marker(path) is None
+
+
+def test_interrupted_migration_leaves_nothing_and_retries_cleanly(
+    tmp_path, monkeypatch
+):
+    """A crash once the rebuild has deleted and rewritten part of the
+    digest table must roll back everything: no marker, original object
+    digests intact, and the next startup verifies and migrates normally.
+    """
+    import app.db as db_module
+
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 5):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 4)")
+    _legacy_chain(conn, "s", (1, 2, 3, 4))
+    conn.commit()
+    conn.close()
+    _enable_wal(path)
+    original = _digest_rows(path, "s")
+
+    # Make the rebuild fail halfway: the first stream's DELETE already
+    # ran inside the open write transaction when the raise fires.
+    real_rebuild = db_module.NonceStore._rebuild_retained_links
+    calls = {"count": 0}
+
+    def failing_rebuild(self, conn, stream_id, compacted_until, high_water):
+        real_rebuild(self, conn, stream_id, compacted_until, 2)
+        calls["count"] += 1
+        raise RuntimeError("simulated crash mid-migration")
+
+    monkeypatch.setattr(
+        db_module.NonceStore, "_rebuild_retained_links", failing_rebuild
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        NonceStore(path)
+    assert calls["count"] == 1
+
+    # The rollback restored the object-format digests; no marker exists,
+    # so the interrupted attempt is indistinguishable from "not started".
+    assert _digest_rows(path, "s") == original
+    assert _format_marker(path) is None
+
+    monkeypatch.undo()
+    store = NonceStore(path)  # retried in full, succeeds
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+    expected = ZERO_DIGEST
+    for i in range(1, 5):
+        expected = chain_digest(expected, "s", i, {"v": i})
+    assert store.stream_integrity("s") == (0, 4, expected, None)
+
+
+def test_two_concurrent_startups_migrate_exactly_once(tmp_path):
+    """Two connections starting the migration at once serialise on the
+    write lock: the loser re-reads the marker inside its own
+    transaction, finds array-v2 and skips the rebuild instead of
+    re-verifying chains that are already array-encoded.
+    """
+    path = _test_reproducing_the_race_setup(tmp_path)
+    for _ in range(3):
+        first = _StartStoreThread(path)
+        second = _StartStoreThread(path)
+        first.start()
+        second.start()
+        first.join(15)
+        second.join(15)
+        assert first.error is None and second.error is None
+        assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+
+    expected = ZERO_DIGEST
+    for i in (1, 2, 3):
+        expected = chain_digest(expected, "s", i, {"v": i})
+    assert first.store.stream_integrity("s") == (0, 3, expected, None)
+
+
+def test_pre_lock_commit_of_buffered_event_stays_unlinked(tmp_path):
+    """A commit made while the migration waits for the lock that merely
+    buffers an event behind a gap advances nothing: the rebuild follows
+    the (still old) watermark and the buffered event keeps no link; once
+    the gap is filled afterwards normal ingestion links it.
+    """
+    path = _test_reproducing_the_race_setup(tmp_path)
+
+    peer = threading.Thread(
+        target=_legacy_buffered_commit_while_migration_waits,
+        args=(path, "s", 5, {"v": 5}),
+    )
+    peer.start()
+    time.sleep(0.2)  # let the peer take the lock
+
+    migrator = _StartStoreThread(path)
+    migrator.start()
+    peer.join(15)
+    migrator.join(15)
+    assert migrator.error is None
+    store = migrator.store
+
+    # The peer only buffered seq 5 behind the missing 4: no link for it
+    # and the watermark the migration observed is still 3.
+    assert [s for s, _ in _digest_rows(path, "s")] == [1, 2, 3]
+    assert store.stream_integrity("s")[:2] == (0, 3)
+
+    # Fill the gap with the current code: seq 4 opens and the walk
+    # immediately picks up the pre-committed buffered seq 5.
+    status, opened, watermark = store.store_stream_event(
+        nonce="n-s-4", method="POST", path="/streams/events", now=3,
+        stream_id="s", sequence=4, data={"v": 4},
+    )
+    assert (status, opened, watermark) == ("ok", [4, 5], 5)
+    expected = ZERO_DIGEST
+    for i in (1, 2, 3, 4, 5):
+        expected = chain_digest(expected, "s", i, {"v": i})
+    assert store.stream_integrity("s") == (0, 5, expected, None)
 
 
 # --- HTTP endpoint -----------------------------------------------------------
