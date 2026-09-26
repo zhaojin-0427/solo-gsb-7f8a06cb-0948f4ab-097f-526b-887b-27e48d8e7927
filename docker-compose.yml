@@ -1,0 +1,19 @@
+services:
+  webhook-verifier:
+    build: .
+    ports:
+      # Bind to the loopback interface only; the service is intended for
+      # local use and is not exposed on any other network interface.
+      - "127.0.0.1:8000:8000"
+    environment:
+      # Local-development default ONLY. Override with your own secret, e.g.:
+      #   WEBHOOK_SECRET=my-real-secret docker compose up --build
+      # or put WEBHOOK_SECRET=... in a .env file next to this file.
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-only-secret-change-me}
+      NONCE_DB_PATH: /app/data/nonces.db
+    volumes:
+      - nonce-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  nonce-data:
