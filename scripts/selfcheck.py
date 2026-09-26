@@ -517,6 +517,43 @@ with tempfile.TemporaryDirectory() as tmp:
     check("corrupted chain left untouched (no silent rewrite)",
           after == before and marker_count == 0)
 
+# --- migration covers commits that landed before its write lock ----------------
+with tempfile.TemporaryDirectory() as tmp:
+    db_path = os.path.join(tmp, "race-v1.db")
+    build_object_format_db(db_path)
+    # A concurrent connection commits a new open event before the migration
+    # takes its write lock: an array-encoding link onto the stored object
+    # tail, exactly what the current ingestion path writes.
+    conn = sqlite3.connect(db_path)
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO stream_events VALUES (?,?,?,?,?)",
+        ("s", 4, json.dumps({"v": 4}, separators=(",", ":")), "o4", ts))
+    object_tail = conn.execute(
+        "SELECT digest FROM stream_digests WHERE stream_id='s' AND sequence=3"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO stream_digests VALUES (?,?,?)",
+        ("s", 4, chain_digest(object_tail, "s", 4, {"v": 4})))
+    conn.execute("UPDATE stream_watermarks SET high_water=4 WHERE stream_id='s'")
+    conn.commit()
+    conn.close()
+
+    migrated = NonceStore(db_path)
+    expected = ZERO_DIGEST
+    for seq in (1, 2, 3, 4):
+        expected = chain_digest(expected, "s", seq, {"v": seq})
+    check("pre-migration commit is included in the rebuild",
+          migrated.stream_integrity("s") == (0, 4, expected, None))
+    conn = sqlite3.connect(db_path)
+    marker_row = conn.execute(
+        "SELECT value FROM app_meta WHERE key='digest_format'"
+    ).fetchone()
+    conn.close()
+    check("marker committed after covering the concurrent commit",
+          marker_row is not None and marker_row[0] == DIGEST_FORMAT_ARRAY_V2)
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED")

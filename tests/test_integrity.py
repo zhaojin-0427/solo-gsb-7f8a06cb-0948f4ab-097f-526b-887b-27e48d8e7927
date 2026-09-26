@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -767,6 +768,307 @@ def test_unrecognised_format_marker_refuses_startup(tmp_path):
     conn.close()
     with pytest.raises(RuntimeError, match="unrecognised digest_format"):
         NonceStore(path)
+
+
+# --- migration concurrency boundaries -----------------------------------------
+
+
+def _raw_commit_open_event(path, stream_id, sequence, data, timeout=10):
+    """Commit a newly opened event from a separate connection, exactly
+    the way the current ingestion path does: the event row, an
+    array-encoding link chained onto whatever digest is stored at the
+    current watermark, and the watermark bump, in one BEGIN IMMEDIATE
+    transaction."""
+    conn = sqlite3.connect(path, timeout=timeout)
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO stream_events VALUES (?,?,?,?,?)",
+            (
+                stream_id,
+                sequence,
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                f"raw-{stream_id}-{sequence}",
+                1,
+            ),
+        )
+        high_water = conn.execute(
+            "SELECT high_water FROM stream_watermarks WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0]
+        assert sequence == high_water + 1
+        anchor = conn.execute(
+            "SELECT digest FROM stream_digests "
+            "WHERE stream_id = ? AND sequence = ?",
+            (stream_id, high_water),
+        ).fetchone()
+        previous = anchor[0] if anchor is not None else ZERO_DIGEST
+        conn.execute(
+            "INSERT INTO stream_digests VALUES (?,?,?)",
+            (
+                stream_id,
+                sequence,
+                chain_digest(previous, stream_id, sequence, data),
+            ),
+        )
+        conn.execute(
+            "UPDATE stream_watermarks SET high_water = ? WHERE stream_id = ?",
+            (sequence, stream_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _object_db_with_chain(tmp_path, sequences=(1, 2, 3)):
+    """An object-format database whose stream 's' is opened through the
+    given sequences, with a matching legacy chain and no marker."""
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in sequences:
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute(
+        "INSERT INTO stream_watermarks VALUES ('s', ?)", (max(sequences),)
+    )
+    _legacy_chain(conn, "s", sequences)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _expected_array_chain(stream_id, sequences):
+    expected = ZERO_DIGEST
+    for i in sequences:
+        expected = chain_digest(expected, stream_id, i, {"v": i})
+    return expected
+
+
+def test_commit_before_migration_lock_is_included_in_rebuild(tmp_path):
+    """Regression: an open event committed by the current ingestion code
+    before the migration's write lock must be covered by the rebuild.
+
+    The pre-fix migration verified and read the watermarks in a read-only
+    transaction, then rebuilt in a separate one: a commit landing between
+    the two had its fresh digest deleted by the rebuild and never
+    recomputed, so /integrity reported the new sequence invalid.
+    """
+    path = _object_db_with_chain(tmp_path)
+
+    # The concurrent connection commits first: its link is array-encoded
+    # onto the stored object tail, exactly what the ingestion path writes
+    # against a not-yet-migrated database.
+    _raw_commit_open_event(path, "s", 4, {"v": 4})
+
+    store = NonceStore(path)  # startup verifies, then re-encodes
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+
+    # The rebuild covers the pre-migration commit: all four links are
+    # chained from the zero anchor in the array encoding and verify.
+    rows = _digest_rows(path, "s")
+    assert [sequence for sequence, _ in rows] == [1, 2, 3, 4]
+    expected = ZERO_DIGEST
+    for sequence, stored in rows:
+        expected = chain_digest(expected, "s", sequence, {"v": sequence})
+        assert stored == expected
+    assert store.stream_integrity("s") == (0, 4, expected, None)
+
+
+def test_migration_holds_write_lock_from_verification_on(tmp_path, monkeypatch):
+    """Regression: verification, the watermark reads and the rebuild run
+    inside the migration's write transaction -- no writer can slip a
+    commit between the verified snapshot and the rewrite."""
+    path = _object_db_with_chain(tmp_path)
+
+    probed = []
+    original = NonceStore._verify_object_chain
+
+    def spy(self, conn, stream_id, high_water):
+        # While the migration verifies, its write lock must already be
+        # held: a non-blocking writer on another connection is refused.
+        probe = sqlite3.connect(path, timeout=0)
+        probe.isolation_level = None
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                probe.execute("BEGIN IMMEDIATE")
+        finally:
+            probe.close()
+        probed.append(stream_id)
+        return original(self, conn, stream_id, high_water)
+
+    monkeypatch.setattr(NonceStore, "_verify_object_chain", spy)
+    store = NonceStore(path)
+    assert probed == ["s"]
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+    assert store.stream_integrity("s") == (
+        0, 3, _expected_array_chain("s", (1, 2, 3)), None,
+    )
+
+
+def test_commit_during_migration_serializes_on_the_write_lock(
+    tmp_path, monkeypatch
+):
+    """A writer racing the migration blocks on its write lock and then
+    chains onto the migrated tail; the final chain always verifies."""
+    path = _object_db_with_chain(tmp_path)
+
+    # Hold the migration's write transaction open so the racing writer
+    # reliably arrives while the migration is in flight.
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
+    original = NonceStore._rebuild_retained_links
+
+    def paused(self, conn, stream_id, compacted_until, high_water):
+        rebuild_started.set()
+        assert release_rebuild.wait(timeout=10)
+        return original(self, conn, stream_id, compacted_until, high_water)
+
+    monkeypatch.setattr(NonceStore, "_rebuild_retained_links", paused)
+
+    errors = []
+
+    def migrate():
+        try:
+            NonceStore(path)
+        except Exception as exc:  # pragma: no cover - failure reporting
+            errors.append(exc)
+
+    def write():
+        try:
+            assert rebuild_started.wait(timeout=10)
+            _raw_commit_open_event(path, "s", 4, {"v": 4})
+        except Exception as exc:  # pragma: no cover - failure reporting
+            errors.append(exc)
+
+    migrator = threading.Thread(target=migrate)
+    writer = threading.Thread(target=write)
+    migrator.start()
+    writer.start()
+    # The writer's BEGIN IMMEDIATE must still be queued on the migration's
+    # write lock; it cannot commit while the migration is in flight.
+    writer.join(timeout=5)
+    assert writer.is_alive()
+    release_rebuild.set()
+    migrator.join(timeout=10)
+    writer.join(timeout=10)
+    assert not migrator.is_alive() and not writer.is_alive()
+    assert errors == []
+
+    store = NonceStore(path)
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+    assert store.stream_integrity("s") == (
+        0, 4, _expected_array_chain("s", (1, 2, 3, 4)), None,
+    )
+
+
+def test_concurrent_starters_migrate_exactly_once(tmp_path):
+    """Two services starting against the same legacy database: one
+    migrates, the other observes the committed marker inside its own
+    write transaction and skips; both then chain new events onto the
+    migrated tail."""
+    path = _object_db_with_chain(tmp_path)
+
+    errors = []
+
+    def start(tag):
+        try:
+            store = NonceStore(path)
+            status, _, _ = store.store_stream_event(
+                nonce=f"post-{tag}", method="POST", path="/p", now=1,
+                stream_id="s", sequence=4 + tag, data={"v": 4 + tag},
+            )
+            assert status == "ok"
+        except Exception as exc:  # pragma: no cover - failure reporting
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(start, range(2)))
+    assert errors == []
+
+    store = NonceStore(path)
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+    assert store.stream_integrity("s") == (
+        0, 5, _expected_array_chain("s", (1, 2, 3, 4, 5)), None,
+    )
+
+
+def test_interrupted_migration_commits_nothing_and_retries(
+    tmp_path, monkeypatch
+):
+    """A failure inside the migration transaction rolls everything back;
+    the next startup re-verifies and migrates cleanly."""
+    path = _object_db_with_chain(tmp_path)
+    before = _digest_rows(path, "s")
+
+    def boom(self, conn, value):
+        raise RuntimeError("simulated crash mid-migration")
+
+    monkeypatch.setattr(NonceStore, "_write_format_marker", boom)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        NonceStore(path)
+    # Nothing committed: digests untouched, no marker written.
+    assert _digest_rows(path, "s") == before
+    assert _format_marker(path) is None
+
+    # With the fault cleared the retry migrates cleanly.
+    monkeypatch.undo()
+    store = NonceStore(path)
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+    assert store.stream_integrity("s") == (
+        0, 3, _expected_array_chain("s", (1, 2, 3)), None,
+    )
+
+
+def test_migration_refuses_a_tail_matching_neither_encoding(tmp_path):
+    """A stored link matching neither the legacy nor the array encoding
+    is corruption, not a legitimate concurrent-ingestion tail."""
+    path = _object_db_with_chain(tmp_path)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE stream_digests SET digest = ? "
+        "WHERE stream_id = 's' AND sequence = 3",
+        (b"\xee" * 32,),
+    )
+    conn.commit()
+    before = _digest_rows(path, "s")
+    conn.close()
+
+    with pytest.raises(ChainCorruptionError) as excinfo:
+        NonceStore(path)
+    assert "sequence 3" in str(excinfo.value)
+    assert _digest_rows(path, "s") == before
+    assert _format_marker(path) is None
+
+
+def test_migration_refuses_object_links_after_an_array_tail(tmp_path):
+    """The encoding may switch object -> array at most once (concurrent
+    ingestion never writes object links); an object link following an
+    array link cannot come from real ingestion and is refused."""
+    path = _object_db_with_chain(tmp_path, sequences=(1,))
+    conn = sqlite3.connect(path)
+    for i in (2, 3):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("UPDATE stream_watermarks SET high_water = 3")
+    # Link 2: array encoding onto the object tail (legitimate concurrent
+    # ingestion); link 3: object encoding again (impossible in practice).
+    object_tail = conn.execute(
+        "SELECT digest FROM stream_digests WHERE stream_id='s' AND sequence=1"
+    ).fetchone()[0]
+    array_link = chain_digest(object_tail, "s", 2, {"v": 2})
+    conn.execute(
+        "INSERT INTO stream_digests VALUES (?,?,?)", ("s", 2, array_link)
+    )
+    conn.execute(
+        "INSERT INTO stream_digests VALUES (?,?,?)",
+        ("s", 3, legacy_chain_digest(array_link, "s", 3, {"v": 3})),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ChainCorruptionError) as excinfo:
+        NonceStore(path)
+    assert "sequence 3" in str(excinfo.value)
+    assert _format_marker(path) is None
 
 
 # --- HTTP endpoint -----------------------------------------------------------

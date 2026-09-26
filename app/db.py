@@ -46,14 +46,21 @@ touching events, nonces, leases, watermarks or consumption progress:
   retained, already-open events chained from the existing compaction
   bound using a zero anchor;
 * databases holding chains in the legacy *object* link encoding are
-  verified link by link and then re-encoded to the array encoding
-  inside a single write transaction (a zero-digest anchor is placed at
-  the compaction bound of already-compacted streams, whose deleted
-  prefix can no longer be recomputed). A legacy chain that fails
-  verification is never silently rewritten: startup aborts with
-  :class:`ChainCorruptionError` instead. The migration commits the
-  recomputed digests and the ``digest_format`` marker atomically, so an
-  interrupted migration is simply retried in full on the next start.
+  verified link by link and re-encoded to the array encoding inside a
+  single ``BEGIN IMMEDIATE`` write transaction: the write lock is taken
+  before the legacy chains, the watermarks and the compaction bounds
+  are read, so the verified snapshot is exactly the state being
+  rewritten and a concurrent event commit either is included in the
+  rebuild or waits for the migration to commit. Verification accepts a
+  tail of array-encoding links appended by concurrent ingestion onto
+  the stored object-encoding chain (one encoding switch, never back);
+  anything else that fails verification is never silently rewritten:
+  startup aborts with :class:`ChainCorruptionError` instead. A
+  zero-digest anchor is placed at the compaction bound of
+  already-compacted streams, whose deleted prefix can no longer be
+  recomputed. The migration commits the recomputed digests and the
+  ``digest_format`` marker atomically, so an interrupted migration is
+  simply retried in full on the next start.
 """
 
 from __future__ import annotations
@@ -126,8 +133,22 @@ class NonceStore:
         conn.isolation_level = None
         # NOTE: journal_mode=WAL performs an implicit COMMIT when it
         # actually changes the journal mode; in autocommit mode that is
-        # harmless, and after the first connection it is a no-op.
-        conn.execute("PRAGMA journal_mode=WAL")
+        # harmless, and after the first connection it is a no-op. The
+        # one racy case is a database file that is not in WAL mode yet
+        # being opened by several connections at once (e.g. two service
+        # instances starting against the same legacy file): switching
+        # the mode needs an exclusive lock the busy timeout does not
+        # cover, so the loser of that race gets SQLITE_BUSY -- retry
+        # briefly until the winner has switched the file over.
+        for attempt in range(100):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) or attempt == 99:
+                    conn.close()
+                    raise
+                time.sleep(0.05)
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
@@ -247,7 +268,9 @@ class NonceStore:
         elif digest_format is None or digest_format == DIGEST_FORMAT_OBJECT_V1:
             # Chains exist in the legacy object encoding (databases that
             # predate the marker have no row, which means the same):
-            # verify them, then re-encode to the array format.
+            # verify them and re-encode to the array format. The marker
+            # is re-checked inside the migration's write transaction, so
+            # this pre-lock read cannot cause a double migration.
             self._migrate_object_chains_to_array()
         elif digest_format != DIGEST_FORMAT_ARRAY_V2:
             raise RuntimeError(
@@ -381,16 +404,23 @@ class NonceStore:
     def _verify_object_chain(
         self, conn: sqlite3.Connection, stream_id: str, high_water: int
     ) -> Optional[int]:
-        """First invalid sequence of a legacy object-format chain.
+        """First invalid sequence of a stored pre-migration chain.
 
-        Replays the stored chain with the legacy encoding exactly the
-        way :meth:`stream_integrity` does for current chains: from the
-        retained anchor at the compaction bound (the zero digest when no
-        anchor row exists) over every retained event up to the
-        watermark. Returns ``None`` when every link verifies, otherwise
-        the sequence whose event/digest is missing or mismatched (or the
-        compaction bound itself when the retained anchor row is
-        malformed).
+        Replays the stored chain exactly the way :meth:`stream_integrity`
+        does for current chains: from the retained anchor at the
+        compaction bound (the zero digest when no anchor row exists)
+        over every retained event up to the watermark. Links are
+        expected in the legacy object encoding -- with one exception: a
+        concurrent writer running the *current* ingestion code against a
+        not-yet-migrated database appends **array**-encoding links
+        chained onto whatever digest was stored at the watermark it
+        opened onto. Such a tail is legitimate committed state that the
+        rebuild must cover, not corruption, so the encoding may switch
+        from object to array at most once and never back. Anything else
+        -- a missing event, a missing link, a link matching neither
+        encoding, a malformed anchor row -- is reported by returning its
+        sequence (or the compaction bound for a malformed anchor);
+        ``None`` means every link verified.
         """
         compacted_until = self._compaction_bound(conn, stream_id)
         anchor_row = conn.execute(
@@ -404,6 +434,7 @@ class NonceStore:
                 return compacted_until
         else:
             previous = ZERO_DIGEST
+        object_encoding = True
         sequence = compacted_until + 1
         while sequence <= high_water:
             event_row = conn.execute(
@@ -413,15 +444,27 @@ class NonceStore:
             ).fetchone()
             if event_row is None:
                 return sequence
-            expected = legacy_chain_digest(
-                previous, stream_id, sequence, json.loads(event_row[0])
-            )
+            data = json.loads(event_row[0])
             stored_row = conn.execute(
                 "SELECT digest FROM stream_digests "
                 "WHERE stream_id = ? AND sequence = ?",
                 (stream_id, sequence),
             ).fetchone()
-            if stored_row is None or bytes(stored_row[0]) != expected:
+            stored = bytes(stored_row[0]) if stored_row is not None else None
+            if object_encoding:
+                expected = legacy_chain_digest(
+                    previous, stream_id, sequence, data
+                )
+                if stored is not None and stored == expected:
+                    previous = expected
+                    sequence += 1
+                    continue
+                # Not a valid object link: the only legitimate
+                # alternative is the start of an array-encoding tail
+                # written by current ingestion before the migration ran.
+                object_encoding = False
+            expected = chain_digest(previous, stream_id, sequence, data)
+            if stored is None or stored != expected:
                 return sequence
             previous = expected
             sequence += 1
@@ -430,21 +473,46 @@ class NonceStore:
     def _migrate_object_chains_to_array(self) -> None:
         """Re-encode every stored object-format chain to the array format.
 
-        Phase 1 verifies every legacy chain inside one read-only
-        snapshot; any corruption aborts the startup with
-        :class:`ChainCorruptionError` and nothing is rewritten. Phase 2
-        recomputes all digests in the array encoding and writes the
-        ``digest_format`` marker inside a single ``BEGIN IMMEDIATE``
-        transaction, so an interrupted migration commits nothing and is
-        retried in full on the next start. Only the digest table and the
-        marker row are touched: events, nonces, leases, watermarks and
-        consumption progress are preserved by construction.
+        The marker re-check, the legacy-chain verification, the stream /
+        compaction-bound / watermark reads, the digest rebuild and the
+        ``digest_format`` marker write all run inside a **single**
+        ``BEGIN IMMEDIATE`` transaction. Taking the write lock before
+        anything is read is what makes the migration race-free: a
+        concurrent event commit either lands first (and is then part of
+        the state that gets verified and rebuilt) or blocks until the
+        migration commits and chains onto the migrated tail -- a newly
+        opened event can never be left digest-less by a rebuild working
+        off a pre-commit watermark. A commit that landed first may have
+        appended array-encoding links onto the stored object-encoding
+        tail; verification accepts exactly that shape (one switch from
+        the legacy to the array encoding, never back) and the rebuild
+        normalises it, while a genuinely corrupt legacy chain aborts the
+        startup with :class:`ChainCorruptionError` and rolls the
+        transaction back, leaving every digest untouched. An interrupted
+        migration likewise commits nothing and is retried in full on the
+        next start. Only the digest table and the marker row are
+        touched: events, nonces, leases, watermarks and consumption
+        progress are preserved by construction.
         """
         conn = self._connect()
         try:
-            # 1) Verify before rewriting anything (read-only snapshot).
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             try:
+                # Re-check the marker inside the write transaction: the
+                # dispatching read in init_db() ran before this lock was
+                # taken, and a concurrent starter may already have
+                # completed the migration. Skipping here keeps a double
+                # migration a no-op instead of a redundant rebuild.
+                row = conn.execute(
+                    "SELECT value FROM app_meta WHERE key = 'digest_format'"
+                ).fetchone()
+                if row is not None and row[0] == DIGEST_FORMAT_ARRAY_V2:
+                    conn.rollback()
+                    return
+
+                # 1) Verify before rewriting anything. The write lock is
+                #    already held, so the verified snapshot is exactly
+                #    the state the rebuild below re-encodes.
                 streams = self._chain_streams(conn)
                 corrupted = [
                     (stream_id, bad)
@@ -453,22 +521,19 @@ class NonceStore:
                         conn, stream_id, high_water
                     )) is not None
                 ]
-            finally:
-                conn.rollback()
-            if corrupted:
-                details = ", ".join(
-                    f"stream {stream_id!r} at sequence {sequence}"
-                    for stream_id, sequence in corrupted
-                )
-                raise ChainCorruptionError(
-                    "stored object-format integrity chain failed "
-                    f"verification ({details}); refusing to re-encode "
-                    "corrupted digests -- every digest was left untouched"
-                )
+                if corrupted:
+                    details = ", ".join(
+                        f"stream {stream_id!r} at sequence {sequence}"
+                        for stream_id, sequence in corrupted
+                    )
+                    raise ChainCorruptionError(
+                        "stored object-format integrity chain failed "
+                        f"verification ({details}); refusing to re-encode "
+                        "corrupted digests -- every digest was left untouched"
+                    )
 
-            # 2) Recompute all digests + the marker in one transaction.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
+                # 2) Recompute all digests + the marker in the same
+                #    transaction that verified the legacy chains.
                 for stream_id, high_water in streams:
                     self._rebuild_retained_links(
                         conn,
